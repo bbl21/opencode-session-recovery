@@ -33,6 +33,8 @@ def eprint(*args, **kwargs):
 
 
 def backup_db():
+    if os.path.exists(BACKUP_PATH):
+        os.remove(BACKUP_PATH)
     shutil.copy2(DB_PATH, BACKUP_PATH)
     eprint(f'[{OK}] Database backed up to {BACKUP_PATH}')
 
@@ -48,6 +50,25 @@ def ensure_db():
         eprint(f'[{ERR}] No read permission: {DB_PATH}')
         return False
     return True
+
+
+def session_info(cursor, sid):
+    """Return (agent_type, is_subagent, parent_title) for a session."""
+    cursor.execute(
+        'SELECT agent, parent_id FROM session WHERE id = ?', (sid,))
+    row = cursor.fetchone()
+    if not row:
+        return 'unknown', False, None
+    agent, parent_id = row
+    is_sub = parent_id is not None
+    parent_title = None
+    if is_sub:
+        cursor.execute(
+            'SELECT title FROM session WHERE id = ?', (parent_id,))
+        pt = cursor.fetchone()
+        if pt:
+            parent_title = pt[0]
+    return (agent or 'build'), is_sub, parent_title
 
 
 # ── queries ──────────────────────────────────────────────────────────
@@ -306,6 +327,88 @@ def cmd_update(old_path, new_path, dry_run=False):
     return 0
 
 
+def cmd_migrate(old_path, new_path, count=5, dry_run=False):
+    """
+    --migrate: migrate N latest sessions from old project to new project,
+    updating both directory and project_id. Shows subagent distinction.
+    """
+    if not ensure_db():
+        return 1
+
+    old_norm = os.path.normpath(old_path)
+    new_norm = os.path.normpath(new_path)
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Find target project_id from new worktree
+    c.execute('SELECT id FROM project WHERE worktree = ?', (new_norm,))
+    target_project = c.fetchone()
+    if not target_project:
+        eprint(f'[{ERR}] No project found with worktree: {new_path}')
+        conn.close()
+        return 1
+    target_project_id = target_project[0]
+
+    # Find source project_id from old worktree
+    c.execute('SELECT id FROM project WHERE worktree = ?', (old_norm,))
+    source_project = c.fetchone()
+    source_project_id = source_project[0] if source_project else None
+
+    # Get latest N sessions from source directory
+    c.execute('''
+        SELECT id, title, directory, project_id, time_created
+        FROM session
+        WHERE directory = ?
+        ORDER BY time_created DESC
+        LIMIT ?
+    ''', (old_norm, count))
+
+    rows = c.fetchall()
+    if not rows:
+        eprint(f'[{ERR}] No sessions found with directory: {old_path}')
+        conn.close()
+        return 1
+
+    # Check for sessions that already belong to target project
+    already_in_target = [r for r in rows if r[3] == target_project_id]
+    fresh = [r for r in rows if r[3] != target_project_id]
+    if not fresh:
+        eprint(f'[{OK}] All {len(rows)} latest session(s) already belong to target project.')
+        conn.close()
+        return 0
+
+    eprint(f'[*] {len(fresh)} session(s) to migrate (from {old_path} → {new_path}):\n')
+    for sid, title, directory, pid, created in fresh:
+        ts = (datetime.fromtimestamp(created / 1000).strftime('%Y-%m-%d %H:%M:%S')
+              if created else 'N/A')
+        agent, is_sub, parent_title = session_info(c, sid)
+        sub_tag = ' [subagent]' if is_sub else ''
+        parent_info = f'  parent: {parent_title}' if parent_title else ''
+        eprint(f'  {ts}  {sid}')
+        eprint(f'  {title or "(untitled)"}{sub_tag}  (agent={agent})')
+        if parent_info:
+            eprint(parent_info)
+        eprint(f'  old project_id: {pid[:20] if pid else "NONE"}...')
+        eprint(f'  new project_id: {target_project_id[:20]}...')
+        eprint()
+
+    if already_in_target:
+        eprint(f'  ({len(already_in_target)} already in target project, skipped)\n')
+
+    if not dry_run:
+        for sid, *_ in fresh:
+            c.execute('UPDATE session SET directory = ?, project_id = ? WHERE id = ?',
+                      (new_norm, target_project_id, sid))
+        conn.commit()
+        eprint(f'[{OK}] Migrated {len(fresh)} session(s) → {new_norm}')
+    else:
+        eprint(f'[Preview] Would migrate {len(fresh)} session(s).')
+
+    conn.close()
+    return 0
+
+
 # ── entry ────────────────────────────────────────────────────────────
 
 def main():
@@ -321,16 +424,20 @@ def main():
     parser.add_argument('--check', action='store_true',
                         help='List sessions whose directory no longer exists')
     parser.add_argument('--old',
-                        help='Old / stale project path (manual mode)')
+                        help='Old / stale project path (manual or migrate mode)')
     parser.add_argument('--new',
-                        help='New / current project path (manual mode)')
+                        help='New / current project path (manual or migrate mode)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Preview mode — do not modify database')
     parser.add_argument('--relink', action='store_true',
                         help='Auto-match stale sessions via project_id')
+    parser.add_argument('--migrate', action='store_true',
+                        help='Migrate N latest sessions from --old to --new, updating directory + project_id')
+    parser.add_argument('--count', type=int, default=5,
+                        help='Number of latest sessions to migrate (default: 5)')
     args = parser.parse_args()
 
-    if not any([args.check, args.old, args.relink]):
+    if not any([args.check, args.old, args.relink, args.migrate]):
         parser.print_help()
         return 1
 
@@ -338,11 +445,17 @@ def main():
         return cmd_check()
     elif args.relink:
         return cmd_relink(dry_run=args.dry_run)
+    elif args.migrate:
+        if not args.old or not args.new:
+            eprint('[Error] --migrate requires both --old and --new.')
+            parser.print_help()
+            return 1
+        return cmd_migrate(args.old, args.new, count=args.count, dry_run=args.dry_run)
     elif args.old and args.new:
         return cmd_update(args.old, args.new, dry_run=args.dry_run)
     else:
         eprint('[Error] --old and --new must be used together, '
-               'or use --relink / --check.')
+               'or use --relink / --check / --migrate.')
         parser.print_help()
         return 1
 
