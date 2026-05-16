@@ -1,0 +1,4 @@
+*.pyc
+__pycache__/
+*.session-recovery-backup
+docs/
